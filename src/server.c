@@ -774,6 +774,15 @@ dictType stringSetDictType = {
     NULL                    /* allow to expand */
 };
 
+dictType stringLongLongDictType = {
+    dictSdsHash,       /* hash function */
+    NULL,              /* key dup */
+    dictSdsKeyCompare, /* key compare */
+    dictSdsDestructor, /* key destructor */
+    dictVanillaFree,   /* val destructor */
+    NULL               /* allow to expand */
+};
+
 /* Dict for for case-insensitive search using null terminated C strings.
  * The key and value do not have a destructor. */
 dictType externalStringType = {
@@ -2306,6 +2315,9 @@ void initServerConfig(void) {
     server.pause_cron = 0;
     server.dict_resizing = 1;
     server.import_mode = 0;
+    server.tls_client_cert_expiry_warn_threshold = 0;
+    server.client_cert_min_days_until_expiry = -1;
+    server.client_cert_expiry_warned = dictCreate(&stringLongLongDictType);
 
     server.latency_tracking_info_percentiles_len = 3;
     server.latency_tracking_info_percentiles = zmalloc(sizeof(double) * (server.latency_tracking_info_percentiles_len));
@@ -2798,6 +2810,8 @@ void resetServerStats(void) {
     server.stat_active_time = 0;
     server.el_iteration_active = false;
     lazyfreeResetStats();
+    if (server.client_cert_expiry_warned) dictEmpty(server.client_cert_expiry_warned, NULL);
+    server.client_cert_min_days_until_expiry = -1;
 }
 
 /* Make the thread killable at any time, so that kill threads functions
@@ -6003,7 +6017,8 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
                 "total_blocking_keys_on_nokey:%lu\r\n", blocking_keys_on_nokey,
                 "paused_reason:%s\r\n", paused_reason,
                 "paused_actions:%s\r\n", paused_actions,
-                "paused_timeout_milliseconds:%lld\r\n", paused_timeout));
+                "paused_timeout_milliseconds:%lld\r\n", paused_timeout,
+                "client_cert_min_days_until_expiry:%lld\r\n", server.client_cert_min_days_until_expiry));
     }
 
     /* Memory */
