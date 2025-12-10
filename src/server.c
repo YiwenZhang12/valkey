@@ -2316,7 +2316,7 @@ void initServerConfig(void) {
     server.dict_resizing = 1;
     server.import_mode = 0;
     server.tls_client_cert_expiry_warn_threshold = 0;
-    server.client_cert_min_days_until_expiry = -1;
+    server.client_cert_min_seconds_until_expiry = -1;
     server.client_cert_expiry_warned = dictCreate(&stringLongLongDictType);
 
     server.latency_tracking_info_percentiles_len = 3;
@@ -2811,7 +2811,7 @@ void resetServerStats(void) {
     server.el_iteration_active = false;
     lazyfreeResetStats();
     if (server.client_cert_expiry_warned) dictEmpty(server.client_cert_expiry_warned, NULL);
-    server.client_cert_min_days_until_expiry = -1;
+    server.client_cert_min_seconds_until_expiry = -1;
 }
 
 /* Make the thread killable at any time, so that kill threads functions
@@ -6018,7 +6018,7 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
                 "paused_reason:%s\r\n", paused_reason,
                 "paused_actions:%s\r\n", paused_actions,
                 "paused_timeout_milliseconds:%lld\r\n", paused_timeout,
-                "client_cert_min_days_until_expiry:%lld\r\n", server.client_cert_min_days_until_expiry));
+                "client_cert_min_seconds_until_expiry:%lld\r\n", server.client_cert_min_seconds_until_expiry));
     }
 
     /* Memory */
