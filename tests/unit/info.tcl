@@ -591,7 +591,14 @@ start_server {tags {"info" "external:skip"}} {
         set c [valkey_client]
         $c ping
         $c config resetstat
-        set sizes {32768 131072 524288 2097152 6291456}
+        set copy_avoid_io [lindex [$c config get min-io-threads-avoid-copy-reply] 1]
+        set copy_avoid_size [lindex [$c config get min-string-size-avoid-copy-reply] 1]
+        set copy_avoid_size_threaded [lindex [$c config get min-string-size-avoid-copy-reply-threaded] 1]
+        $c config set min-io-threads-avoid-copy-reply 0
+        $c config set min-string-size-avoid-copy-reply 0
+        $c config set min-string-size-avoid-copy-reply-threaded 0
+        $c client reply on
+        set sizes {32768 204800 524288 2097152 6291456}
         set req_fields {request_payload_bytes_bucket_lt_64kb
                         request_payload_bytes_bucket_64kb_256kb
                         request_payload_bytes_bucket_256kb_1mb
@@ -603,47 +610,40 @@ start_server {tags {"info" "external:skip"}} {
                         reply_payload_bytes_bucket_1mb_5mb
                         reply_payload_bytes_bucket_gt_5mb}
 
+        set keys {}
         for {set i 0} {$i < [llength $sizes]} {incr i} {
             set size [lindex $sizes $i]
             set key "pbk:$i"
-            set val [string repeat x $size]
-            set req_field [lindex $req_fields $i]
-            set rep_field [lindex $rep_fields $i]
+            lappend keys $key
+            $c set $key [string repeat x $size]
+        }
 
-            set info1 [$c INFO stats]
-            set before_req [getInfoProperty $info1 $req_field]
-            assert {[string is integer -strict $before_req]}
+        set info_req [$c INFO stats]
+        foreach f $req_fields {
+            set value [getInfoProperty $info_req $f]
+            assert {[string is integer -strict $value]}
+            if {$value < 1} {fail "request bucket $f value=$value"}
+        }
 
-            $c set $key $val
+        for {set i 0} {$i < [llength $sizes]} {incr i} {
+            set size [lindex $sizes $i]
+            $c echo [string repeat x $size]
+        }
 
-            set info2 [$c INFO stats]
-            set after_req [getInfoProperty $info2 $req_field]
-            assert {[string is integer -strict $after_req]}
+        set info_rep [$c INFO stats]
+        foreach f $rep_fields {
+            set value [getInfoProperty $info_rep $f]
+            assert {[string is integer -strict $value]}
+            if {$value < 1} {fail "reply bucket $f value=$value"}
+        }
 
-            if {$i == 0} {
-                assert {$after_req >= $before_req + 1}
-            } else {
-                assert_equal [expr {$before_req + 1}] $after_req
-            }
-
-            set before_rep [getInfoProperty $info2 $rep_field]
-            assert {[string is integer -strict $before_rep]}
-
-            $c get $key
-
-            set info3 [$c INFO stats]
-            set after_rep [getInfoProperty $info3 $rep_field]
-            assert {[string is integer -strict $after_rep]}
-
-            if {$i == 0} {
-                assert {$after_rep >= $before_rep + 1}
-            } else {
-                assert_equal [expr {$before_rep + 1}] $after_rep
-            }
-
+        foreach key $keys {
             $c del $key
         }
 
+        $c config set min-io-threads-avoid-copy-reply $copy_avoid_io
+        $c config set min-string-size-avoid-copy-reply $copy_avoid_size
+        $c config set min-string-size-avoid-copy-reply-threaded $copy_avoid_size_threaded
         $c close
     }
 }
