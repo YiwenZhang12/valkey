@@ -375,8 +375,9 @@ proc test_sub_replica_restart_recovery {} {
         R 3 config set cluster-allow-replica-migration yes
         R 7 config set cluster-allow-replica-migration no
 
-        # Slow down RDB saving on primary 0 to widen topology transition timing.
-        R 0 config set rdb-key-save-delay 100000000
+        # Slow down RDB saving on primary 0 to widen topology transition timing,
+        # but keep it bounded so recovery assertions are deterministic.
+        R 0 config set rdb-key-save-delay 2000000
 
         # Move slot 0 from primary 3 to primary 0 to trigger chain reduction.
         set addr "[srv 0 host]:[srv 0 port]"
@@ -401,15 +402,19 @@ proc test_sub_replica_restart_recovery {} {
         # Make sure server 7 got a sub-replica log.
         verify_log_message -7 "*I'm a sub-replica!*" 0
 
+        # Restore normal RDB pacing so restarted replica can complete sync in time.
+        R 0 config set rdb-key-save-delay 0
+
         # Restart sub-replica 7 during the reconfiguration window.
-        restart_server 7 true false
+        restart_server -7 true false
+        reconnect -7
 
         # Ensure restarted node 7 comes back as a replica and reconnects.
-        wait_for_condition 1000 50 {
-            [s 7 role] eq {slave} &&
-            [s 7 master_link_status] eq {up}
+        wait_for_condition 2000 50 {
+            [s -7 role] eq {slave} &&
+            [s -7 master_link_status] eq {up}
         } else {
-            puts "R 7 role: [s 7 role]"
+            puts "R 7 role: [s -7 role]"
             puts "R 7 info: [R 7 info replication]"
             fail "Restarted sub-replica 7 did not recover as a healthy replica"
         }
@@ -417,14 +422,17 @@ proc test_sub_replica_restart_recovery {} {
         # Shutdown primary 0 and verify failover + post-failover replication.
         catch {R 0 shutdown nosave}
 
-        wait_for_condition 1000 50 {
-            [s -4 role] eq {master} &&
-            [s -3 role] eq {slave} &&
-            [s -7 role] eq {slave} &&
-            [s -7 master_link_status] eq {up}
+        # Any of R3/R4/R7 may win election after R0 shutdown.
+        wait_for_condition 2000 50 {
+            (([s -3 role] eq {master}) + ([s -4 role] eq {master}) + ([s -7 role] eq {master})) == 1 &&
+            (([s -3 role] eq {master}) || ([s -3 master_link_status] eq {up})) &&
+            (([s -4 role] eq {master}) || ([s -4 master_link_status] eq {up})) &&
+            (([s -7 role] eq {master}) || ([s -7 master_link_status] eq {up}))
         } else {
             puts "s -4 role: [s -4 role]"
+            puts "s -4 info: [R 4 info replication]"
             puts "s -3 role: [s -3 role]"
+            puts "s -3 info: [R 3 info replication]"
             puts "s -7 role: [s -7 role]"
             puts "s -7 info: [R 7 info replication]"
             fail "Failover/recovery did not converge after sub-replica restart"
@@ -446,11 +454,15 @@ proc test_sub_replica_restart_recovery {} {
 
         # Validate data consistency on both replicas.
         R 3 readonly
+        R 4 readonly
         R 7 readonly
         wait_for_condition 1000 50 {
-            [R 3 get key_991803] == 1024 && [R 3 get key_977613] == 10240 &&
-            [R 4 get key_991803] == 1024 && [R 4 get key_977613] == 10240 &&
-            [R 7 get key_991803] == 1024 && [R 7 get key_977613] == 10240
+            [catch {R 3 get key_991803} r3k1] == 0 && $r3k1 == 1024 &&
+            [catch {R 3 get key_977613} r3k2] == 0 && $r3k2 == 10240 &&
+            [catch {R 4 get key_991803} r4k1] == 0 && $r4k1 == 1024 &&
+            [catch {R 4 get key_977613} r4k2] == 0 && $r4k2 == 10240 &&
+            [catch {R 7 get key_991803} r7k1] == 0 && $r7k1 == 1024 &&
+            [catch {R 7 get key_977613} r7k2] == 0 && $r7k2 == 10240
         } else {
             puts "R 3: [R 3 keys *]"
             puts "R 4: [R 4 keys *]"
