@@ -356,6 +356,114 @@ start_cluster 4 4 {tags {external:skip cluster} overrides {cluster-node-timeout 
     test_sub_replica "sigstop"
 } my_slot_allocation cluster_allocate_replicas ;# start_cluster
 
+proc test_sub_replica_restart_recovery {} {
+    test "Sub-replica restarted during topology reconfiguration recovers automatically" {
+        # Write some data to primary 0, slot 1, make a small repl_offset.
+        for {set i 0} {$i < 1024} {incr i} {
+            R 0 incr key_991803
+        }
+        assert_equal {1024} [R 0 get key_991803]
+
+        # Write some data to primary 3, slot 0, make a big repl_offset.
+        for {set i 0} {$i < 10240} {incr i} {
+            R 3 incr key_977613
+        }
+        assert_equal {10240} [R 3 get key_977613]
+
+        R 3 config set cluster-replica-validity-factor 0
+        R 7 config set cluster-replica-validity-factor 0
+        R 3 config set cluster-allow-replica-migration yes
+        R 7 config set cluster-allow-replica-migration no
+
+        # Slow down RDB saving on primary 0 to widen topology transition timing.
+        R 0 config set rdb-key-save-delay 100000000
+
+        # Move slot 0 from primary 3 to primary 0 to trigger chain reduction.
+        set addr "[srv 0 host]:[srv 0 port]"
+        set myid [R 3 CLUSTER MYID]
+        set code [catch {
+            exec $::VALKEY_CLI_BIN {*}[valkeycli_tls_config "./tests"] --cluster rebalance $addr --cluster-weight $myid=0
+        } result]
+        if {$code != 0} {
+            fail "valkey-cli --cluster rebalance returns non-zero exit code, output below:\n$result"
+        }
+
+        # Make sure servers 3 and 7 become replicas of primary 0.
+        wait_for_condition 1000 50 {
+            [get_my_primary_peer 3] eq $addr &&
+            [get_my_primary_peer 7] eq $addr
+        } else {
+            puts "R 3 role: [R 3 role]"
+            puts "R 7 role: [R 7 role]"
+            fail "Server 3 and 7 role response has not changed"
+        }
+
+        # Make sure server 7 got a sub-replica log.
+        verify_log_message -7 "*I'm a sub-replica!*" 0
+
+        # Restart sub-replica 7 during the reconfiguration window.
+        restart_server 7 true false
+
+        # Ensure restarted node 7 comes back as a replica and reconnects.
+        wait_for_condition 1000 50 {
+            [s 7 role] eq {slave} &&
+            [s 7 master_link_status] eq {up}
+        } else {
+            puts "R 7 role: [s 7 role]"
+            puts "R 7 info: [R 7 info replication]"
+            fail "Restarted sub-replica 7 did not recover as a healthy replica"
+        }
+
+        # Shutdown primary 0 and verify failover + post-failover replication.
+        catch {R 0 shutdown nosave}
+
+        wait_for_condition 1000 50 {
+            [s -4 role] eq {master} &&
+            [s -3 role] eq {slave} &&
+            [s -7 role] eq {slave} &&
+            [s -7 master_link_status] eq {up}
+        } else {
+            puts "s -4 role: [s -4 role]"
+            puts "s -3 role: [s -3 role]"
+            puts "s -7 role: [s -7 role]"
+            puts "s -7 info: [R 7 info replication]"
+            fail "Failover/recovery did not converge after sub-replica restart"
+        }
+
+        # Wait for cluster convergence.
+        wait_for_condition 1000 50 {
+            [R 3 cluster slots] eq [R 4 cluster slots] &&
+            [R 4 cluster slots] eq [R 7 cluster slots] &&
+            [CI 3 cluster_state] eq "ok" &&
+            [CI 4 cluster_state] eq "ok" &&
+            [CI 7 cluster_state] eq "ok"
+        } else {
+            puts "R 3: [R 3 cluster info]"
+            puts "R 4: [R 4 cluster info]"
+            puts "R 7: [R 7 cluster info]"
+            fail "Cluster is down"
+        }
+
+        # Validate data consistency on both replicas.
+        R 3 readonly
+        R 7 readonly
+        wait_for_condition 1000 50 {
+            [R 3 get key_991803] == 1024 && [R 3 get key_977613] == 10240 &&
+            [R 4 get key_991803] == 1024 && [R 4 get key_977613] == 10240 &&
+            [R 7 get key_991803] == 1024 && [R 7 get key_977613] == 10240
+        } else {
+            puts "R 3: [R 3 keys *]"
+            puts "R 4: [R 4 keys *]"
+            puts "R 7: [R 7 keys *]"
+            fail "Key not consistent"
+        }
+    }
+}
+
+start_cluster 4 4 {tags {external:skip cluster} overrides {cluster-node-timeout 1000 cluster-migration-barrier 999}} {
+    test_sub_replica_restart_recovery
+} my_slot_allocation cluster_allocate_replicas ;# start_cluster
+
 proc test_cluster_setslot {type} {
     test "valkey-cli make source node ignores NOREPLICAS error when doing the last CLUSTER SETSLOT - $type" {
         R 3 config set cluster-allow-replica-migration no

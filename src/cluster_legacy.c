@@ -5994,6 +5994,21 @@ static long long maxConnectionAttemptsPerCron(void) {
     return min_nodes_for_coverage * NODE_CONNECTION_RETRIES_PER_TIMEOUT;
 }
 
+/* Returns C_OK when this replica has a valid cluster-authoritative upstream
+ * that can be used as replication target. */
+static int clusterGetExpectedReplicaUpstream(clusterNode **upstream, const char **ip, int *port) {
+    if (!nodeIsReplica(myself) || !myself->replicaof) return C_ERR;
+
+    clusterNode *n = myself->replicaof;
+    if (!clusterNodeIsPrimary(n)) return C_ERR;
+    if (!nodeHasAddr(n) || nodeFailed(n) || (n->flags & (CLUSTER_NODE_NOADDR | CLUSTER_NODE_HANDSHAKE))) return C_ERR;
+
+    *upstream = n;
+    *ip = n->ip;
+    *port = getNodeDefaultReplicationPort(n);
+    return C_OK;
+}
+
 /* This is executed 10 times every second */
 void clusterCron(void) {
     dictIterator *di;
@@ -6005,6 +6020,12 @@ void clusterCron(void) {
     mstime_t min_pong = 0, now = mstime();
     clusterNode *min_pong_node = NULL;
     static unsigned long long iteration = 0;
+    static mstime_t repl_target_mismatch_since = 0;
+    static mstime_t repl_target_rebind_last = 0;
+    static int repl_target_expected_id_valid = 0;
+    static char repl_target_expected_id[CLUSTER_NAMELEN];
+    static char repl_target_expected_ip[NET_IP_STR_LEN] = {0};
+    static int repl_target_expected_port = 0;
     iteration++; /* Number of times this function was called so far. */
 
     clusterUpdateMyselfHostname();
@@ -6149,11 +6170,70 @@ void clusterCron(void) {
     }
     dictReleaseIterator(di);
 
-    /* If we are a replica node but the replication is still turned off,
-     * enable it if we know the address of our primary and it appears to
-     * be up. */
-    if (nodeIsReplica(myself) && server.primary_host == NULL && myself->replicaof && nodeHasAddr(myself->replicaof)) {
-        replicationSetPrimary(myself->replicaof->ip, getNodeDefaultReplicationPort(myself->replicaof), 0, false);
+    clusterNode *expected_upstream = NULL;
+    const char *expected_ip = NULL;
+    int expected_port = 0;
+    int have_expected_upstream =
+        clusterGetExpectedReplicaUpstream(&expected_upstream, &expected_ip, &expected_port) == C_OK;
+
+    /* If we are a replica node but replication is still turned off,
+     * enable it using the cluster-authoritative upstream. */
+    if (server.primary_host == NULL && have_expected_upstream) {
+        replicationSetPrimary((char *)expected_ip, expected_port, 0, false);
+    }
+
+    /* In cluster mode, replication target must match myself->replicaof.
+     * If we already have a target but it diverges from cluster view,
+     * rebind after a short stability window and debounce interval. */
+    if (server.primary_host != NULL && have_expected_upstream) {
+        int target_mismatch = strcmp(server.primary_host, expected_ip) != 0 || server.primary_port != expected_port;
+        int link_unhealthy = server.repl_state != REPL_STATE_CONNECTED;
+        int expected_id_changed = !repl_target_expected_id_valid ||
+                                  memcmp(repl_target_expected_id, expected_upstream->name, CLUSTER_NAMELEN) != 0;
+        int expected_changed =
+            expected_id_changed || strcmp(repl_target_expected_ip, expected_ip) != 0 ||
+            repl_target_expected_port != expected_port;
+        int failover_transition =
+            server.cluster->mf_end || server.cluster->failover_auth_time || server.failover_state != NO_FAILOVER;
+        const mstime_t mismatch_grace_ms = 2000;
+        const mstime_t mismatch_connected_grace_ms = 30000;
+        const mstime_t rebind_debounce_ms = 5000;
+
+        if (!target_mismatch || failover_transition) {
+            repl_target_mismatch_since = 0;
+            repl_target_expected_id_valid = 0;
+            repl_target_expected_ip[0] = '\0';
+            repl_target_expected_port = 0;
+        } else {
+            if (expected_changed || repl_target_mismatch_since == 0) {
+                memcpy(repl_target_expected_id, expected_upstream->name, CLUSTER_NAMELEN);
+                repl_target_expected_id_valid = 1;
+                valkey_strlcpy(repl_target_expected_ip, expected_ip, sizeof(repl_target_expected_ip));
+                repl_target_expected_port = expected_port;
+                repl_target_mismatch_since = now;
+            }
+
+            mstime_t mismatch_age = now - repl_target_mismatch_since;
+            int should_rebind =
+                (link_unhealthy && mismatch_age >= mismatch_grace_ms) ||
+                (!link_unhealthy && mismatch_age >= mismatch_connected_grace_ms);
+
+            if (should_rebind && (now - repl_target_rebind_last) >= rebind_debounce_ms) {
+                serverLog(LL_NOTICE,
+                          "Replication target mismatch for replica %.40s (%s): current target %s:%d, "
+                          "cluster target %.40s %s:%d. Rebinding.",
+                          myself->name, humanNodename(myself), server.primary_host, server.primary_port,
+                          expected_upstream->name, expected_ip, expected_port);
+                repl_target_rebind_last = now;
+                repl_target_mismatch_since = 0;
+                replicationSetPrimary((char *)expected_ip, expected_port, 0, false);
+            }
+        }
+    } else {
+        repl_target_mismatch_since = 0;
+        repl_target_expected_id_valid = 0;
+        repl_target_expected_ip[0] = '\0';
+        repl_target_expected_port = 0;
     }
 
     /* Abort a manual failover if the timeout is reached. */
